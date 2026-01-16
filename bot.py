@@ -1,5 +1,6 @@
 import os
 import logging
+import sqlite3
 from io import BytesIO
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -31,6 +32,98 @@ if not BOT_TOKEN:
 # Пароль для авторизации
 AUTH_PASSWORD = "CHANGE_ME"
 
+# Путь к базе данных
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.db")
+
+# === ФУНКЦИИ ДЛЯ РАБОТЫ С БД ===
+
+def init_db():
+    """Инициализация базы данных"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            status TEXT DEFAULT 'authorized',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER PRIMARY KEY,
+            variants_count INTEGER DEFAULT 5,
+            use_custom_prompt INTEGER DEFAULT 0,
+            custom_prompt TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    logger.info(f"База данных инициализирована: {DB_PATH}")
+
+def load_users_from_db():
+    """Загрузить пользователей из БД"""
+    authorized = set()
+    blocked = set()
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, status FROM users")
+    for row in cursor.fetchall():
+        user_id, status = row
+        if status == 'authorized':
+            authorized.add(user_id)
+        elif status == 'blocked':
+            blocked.add(user_id)
+    conn.close()
+    
+    logger.info(f"Загружено из БД: {len(authorized)} авторизованных, {len(blocked)} заблокированных")
+    return authorized, blocked
+
+def save_user_to_db(user_id: int, username: str, first_name: str, status: str):
+    """Сохранить пользователя в БД"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO users (user_id, username, first_name, status)
+        VALUES (?, ?, ?, ?)
+    ''', (user_id, username, first_name, status))
+    conn.commit()
+    conn.close()
+    logger.info(f"Пользователь {user_id} ({first_name}) сохранён в БД со статусом: {status}")
+
+def load_user_settings_from_db(user_id: int) -> dict:
+    """Загрузить настройки пользователя из БД"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT variants_count, use_custom_prompt, custom_prompt FROM user_settings WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if row:
+        return {
+            'variants_count': row[0],
+            'use_custom_prompt': bool(row[1]),
+            'custom_prompt': row[2]
+        }
+    return None
+
+def save_user_settings_to_db(user_id: int, settings: dict):
+    """Сохранить настройки пользователя в БД"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO user_settings (user_id, variants_count, use_custom_prompt, custom_prompt)
+        VALUES (?, ?, ?, ?)
+    ''', (user_id, settings['variants_count'], int(settings['use_custom_prompt']), settings['custom_prompt']))
+    conn.commit()
+    conn.close()
+
+# Инициализация БД
+init_db()
+
 # Таймаут 5 минут для отправки больших файлов (~17 МБ)
 session = AiohttpSession(timeout=300)
 bot = Bot(token=BOT_TOKEN, session=session)
@@ -43,12 +136,11 @@ class UserStates(StatesGroup):
     waiting_for_photo = State()
     waiting_for_custom_prompt = State()
 
-# Хранилище настроек пользователей (в продакшене использовать БД)
+# Хранилище настроек пользователей (кэш в памяти)
 user_settings = {}
 
-# Хранилище авторизованных и заблокированных пользователей
-authorized_users = set()
-blocked_users = set()
+# Загружаем пользователей из БД при старте
+authorized_users, blocked_users = load_users_from_db()
 
 # Очередь обработки (только 1 обработка одновременно)
 processing_semaphore = asyncio.Semaphore(1)
@@ -57,12 +149,22 @@ queue_count = 0  # Счетчик ожидающих в очереди
 def get_user_settings(user_id: int) -> dict:
     """Получить настройки пользователя"""
     if user_id not in user_settings:
-        user_settings[user_id] = {
-            'variants_count': 5,  # По умолчанию 5 вариантов
-            'use_custom_prompt': False,  # Использовать кастомный промпт
-            'custom_prompt': None  # Кастомный промпт
-        }
+        # Пробуем загрузить из БД
+        db_settings = load_user_settings_from_db(user_id)
+        if db_settings:
+            user_settings[user_id] = db_settings
+        else:
+            user_settings[user_id] = {
+                'variants_count': 5,  # По умолчанию 5 вариантов
+                'use_custom_prompt': False,  # Использовать кастомный промпт
+                'custom_prompt': None  # Кастомный промпт
+            }
     return user_settings[user_id]
+
+def save_settings(user_id: int):
+    """Сохранить настройки пользователя в БД"""
+    if user_id in user_settings:
+        save_user_settings_to_db(user_id, user_settings[user_id])
 
 def get_persistent_keyboard() -> ReplyKeyboardMarkup:
     """Постоянная клавиатура внизу экрана"""
@@ -158,16 +260,18 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def check_password(message: types.Message, state: FSMContext):
     """Проверка пароля"""
     user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
 
     if message.text == AUTH_PASSWORD:
         # Пароль верный - авторизуем
         authorized_users.add(user_id)
+        save_user_to_db(user_id, username, first_name, 'authorized')
         await state.clear()
 
-        user_name = message.from_user.first_name
         await message.answer(
             f"✅ Авторизация успешна!\n\n"
-            f"👋 Привет, {user_name}!\n\n"
+            f"👋 Привет, {first_name}!\n\n"
             "Я бот для обработки фотографий клубники в шоколаде.\n"
             "Отправь мне фото, и я создам несколько улучшенных вариантов!\n\n"
             "Выбери действие:",
@@ -177,6 +281,7 @@ async def check_password(message: types.Message, state: FSMContext):
     else:
         # Пароль неверный - блокируем
         blocked_users.add(user_id)
+        save_user_to_db(user_id, username, first_name, 'blocked')
         await state.clear()
         await message.answer("🚫 Неверный пароль. Доступ запрещен.")
 
@@ -269,6 +374,7 @@ async def set_variants(callback: types.CallbackQuery):
 
     settings = get_user_settings(user_id)
     settings['variants_count'] = count
+    save_settings(user_id)
 
     await callback.message.edit_text(
         f"✅ Количество фото изменено на {count}",
@@ -300,6 +406,7 @@ async def set_default_prompt(callback: types.CallbackQuery):
 
     settings = get_user_settings(user_id)
     settings['use_custom_prompt'] = False
+    save_settings(user_id)
 
     await callback.message.edit_text(
         "✅ Установлен стандартный промпт",
@@ -322,6 +429,7 @@ async def set_custom_prompt(callback: types.CallbackQuery):
         return
 
     settings['use_custom_prompt'] = True
+    save_settings(user_id)
 
     await callback.message.edit_text(
         "✅ Установлен ваш кастомный промпт",
@@ -365,6 +473,7 @@ async def save_custom_prompt(message: types.Message, state: FSMContext):
     settings = get_user_settings(user_id)
     settings['custom_prompt'] = message.text
     settings['use_custom_prompt'] = True
+    save_settings(user_id)
 
     await message.answer(
         f"✅ Промпт сохранен!\n\n"
