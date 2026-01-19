@@ -56,9 +56,15 @@ def init_db():
             variants_count INTEGER DEFAULT 5,
             use_custom_prompt INTEGER DEFAULT 0,
             custom_prompt TEXT,
+            aspect_ratio TEXT DEFAULT '1:1',
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
     ''')
+    # Миграция: добавляем колонку aspect_ratio если её нет
+    cursor.execute("PRAGMA table_info(user_settings)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if 'aspect_ratio' not in columns:
+        cursor.execute("ALTER TABLE user_settings ADD COLUMN aspect_ratio TEXT DEFAULT '1:1'")
     conn.commit()
     conn.close()
     logger.info(f"База данных инициализирована: {DB_PATH}")
@@ -98,15 +104,16 @@ def load_user_settings_from_db(user_id: int) -> dict:
     """Загрузить настройки пользователя из БД"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT variants_count, use_custom_prompt, custom_prompt FROM user_settings WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT variants_count, use_custom_prompt, custom_prompt, aspect_ratio FROM user_settings WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     conn.close()
-    
+
     if row:
         return {
             'variants_count': row[0],
             'use_custom_prompt': bool(row[1]),
-            'custom_prompt': row[2]
+            'custom_prompt': row[2],
+            'aspect_ratio': row[3] or '1:1'
         }
     return None
 
@@ -115,9 +122,9 @@ def save_user_settings_to_db(user_id: int, settings: dict):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT OR REPLACE INTO user_settings (user_id, variants_count, use_custom_prompt, custom_prompt)
-        VALUES (?, ?, ?, ?)
-    ''', (user_id, settings['variants_count'], int(settings['use_custom_prompt']), settings['custom_prompt']))
+        INSERT OR REPLACE INTO user_settings (user_id, variants_count, use_custom_prompt, custom_prompt, aspect_ratio)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, settings['variants_count'], int(settings['use_custom_prompt']), settings['custom_prompt'], settings.get('aspect_ratio', '1:1')))
     conn.commit()
     conn.close()
 
@@ -157,7 +164,8 @@ def get_user_settings(user_id: int) -> dict:
             user_settings[user_id] = {
                 'variants_count': 5,  # По умолчанию 5 вариантов
                 'use_custom_prompt': False,  # Использовать кастомный промпт
-                'custom_prompt': None  # Кастомный промпт
+                'custom_prompt': None,  # Кастомный промпт
+                'aspect_ratio': '1:1'  # Соотношение сторон
             }
     return user_settings[user_id]
 
@@ -184,11 +192,16 @@ def get_settings_menu(user_id: int) -> InlineKeyboardMarkup:
     settings = get_user_settings(user_id)
 
     prompt_status = "Кастомный" if settings['use_custom_prompt'] else "Стандартный"
+    aspect_ratio = settings.get('aspect_ratio', '1:1')
 
     keyboard = [
         [InlineKeyboardButton(
             text=f"Количество фото: {settings['variants_count']}",
             callback_data="change_variants"
+        )],
+        [InlineKeyboardButton(
+            text=f"Соотношение сторон: {aspect_ratio}",
+            callback_data="change_ratio"
         )],
         [InlineKeyboardButton(
             text=f"Промпт: {prompt_status}",
@@ -206,6 +219,17 @@ def get_variants_menu() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="5", callback_data="variants_5")],
         [InlineKeyboardButton(text="7", callback_data="variants_7"),
          InlineKeyboardButton(text="10", callback_data="variants_10")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="settings")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_ratio_menu() -> InlineKeyboardMarkup:
+    """Меню выбора соотношения сторон"""
+    keyboard = [
+        [InlineKeyboardButton(text="1:1 (квадрат)", callback_data="ratio_1:1"),
+         InlineKeyboardButton(text="3:4 (портрет)", callback_data="ratio_3:4")],
+        [InlineKeyboardButton(text="16:9 (широкий)", callback_data="ratio_16:9"),
+         InlineKeyboardButton(text="9:16 (вертикальный)", callback_data="ratio_9:16")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="settings")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -382,6 +406,39 @@ async def set_variants(callback: types.CallbackQuery):
     )
     await callback.answer()
 
+@dp.callback_query(lambda c: c.data == "change_ratio")
+async def change_ratio(callback: types.CallbackQuery):
+    """Изменить соотношение сторон"""
+    if not await check_auth(callback.from_user.id):
+        await callback.answer("🚫 Доступ запрещен", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "Выбери соотношение сторон для генерируемых фотографий:",
+        reply_markup=get_ratio_menu()
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("ratio_"))
+async def set_ratio(callback: types.CallbackQuery):
+    """Установить соотношение сторон"""
+    user_id = callback.from_user.id
+    if not await check_auth(user_id):
+        await callback.answer("🚫 Доступ запрещен", show_alert=True)
+        return
+
+    ratio = callback.data.replace("ratio_", "")
+
+    settings = get_user_settings(user_id)
+    settings['aspect_ratio'] = ratio
+    save_settings(user_id)
+
+    await callback.message.edit_text(
+        f"✅ Соотношение сторон изменено на {ratio}",
+        reply_markup=get_settings_menu(user_id)
+    )
+    await callback.answer()
+
 @dp.callback_query(lambda c: c.data == "change_prompt_mode")
 async def change_prompt_mode(callback: types.CallbackQuery):
     """Открыть меню выбора промпта"""
@@ -524,6 +581,7 @@ async def handle_any_photo(message: types.Message, state: FSMContext):
             # Получаем настройки пользователя
             settings = get_user_settings(user_id)
             variants_count = settings['variants_count']
+            aspect_ratio = settings.get('aspect_ratio', '1:1')
 
             # Определяем какой промпт использовать
             custom_prompt = None
@@ -531,13 +589,13 @@ async def handle_any_photo(message: types.Message, state: FSMContext):
                 custom_prompt = settings['custom_prompt']
 
             await processing_msg.edit_text(
-                f"⏳ Генерирую {variants_count} вариантов...\n"
+                f"⏳ Генерирую {variants_count} вариантов ({aspect_ratio})...\n"
                 "Отправляю каждый по мере готовности!"
             )
 
             # Обрабатываем и отправляем по мере готовности
             sent_count = 0
-            async for idx, img_bytes in process_image_stream(file_bytes, variants_count, custom_prompt):
+            async for idx, img_bytes in process_image_stream(file_bytes, variants_count, custom_prompt, aspect_ratio):
                 sent_count += 1
 
                 # Создаем сжатое превью (макс 1280px, JPEG качество 85)

@@ -29,7 +29,7 @@ if GOOGLE_API_KEY:
 client = genai.Client()
 
 
-def generate_variant(image_part: types.Part, idx: int, prompt: str = None) -> bytes | None:
+def generate_variant(image_part: types.Part, idx: int, prompt: str = None, aspect_ratio: str = "1:1") -> bytes | None:
     """
     Генерация одного варианта изображения (точно как в obrabor.py)
 
@@ -37,6 +37,7 @@ def generate_variant(image_part: types.Part, idx: int, prompt: str = None) -> by
         image_part: Часть изображения для Gemini API
         idx: Индекс варианта
         prompt: Промпт для обработки (если None, используется стандартный)
+        aspect_ratio: Соотношение сторон (1:1, 3:4, 16:9, 9:16)
 
     Returns:
         bytes: Байты обработанного изображения или None в случае ошибки
@@ -52,7 +53,7 @@ def generate_variant(image_part: types.Part, idx: int, prompt: str = None) -> by
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
                 image_config=types.ImageConfig(
-                    aspect_ratio="1:1",
+                    aspect_ratio=aspect_ratio,
                     image_size="4K",
                 ),
             ),
@@ -116,7 +117,7 @@ def prepare_image(image_bytes) -> tuple[bytes, str, types.Part]:
     return img_bytes, mime_type, image_part
 
 
-async def process_image_stream(image_bytes: io.BytesIO, variants_count: int = 5, custom_prompt: str = None):
+async def process_image_stream(image_bytes: io.BytesIO, variants_count: int = 5, custom_prompt: str = None, aspect_ratio: str = "1:1"):
     """
     Асинхронный генератор - отдает результаты по мере готовности
 
@@ -124,6 +125,7 @@ async def process_image_stream(image_bytes: io.BytesIO, variants_count: int = 5,
         image_bytes: Байты исходного изображения
         variants_count: Количество вариантов для генерации
         custom_prompt: Кастомный промпт (если None, используется стандартный)
+        aspect_ratio: Соотношение сторон (1:1, 3:4, 16:9, 9:16)
 
     Yields:
         tuple: (idx, bytes) - номер варианта и байты изображения
@@ -132,7 +134,7 @@ async def process_image_stream(image_bytes: io.BytesIO, variants_count: int = 5,
         _, _, image_part = prepare_image(image_bytes)
 
         prompt_type = "кастомный" if custom_prompt else "стандартный"
-        logger.info(f"Начинаем генерацию {variants_count} вариантов с {prompt_type} промптом")
+        logger.info(f"Начинаем генерацию {variants_count} вариантов с {prompt_type} промптом, соотношение сторон: {aspect_ratio}")
 
         loop = asyncio.get_event_loop()
 
@@ -146,7 +148,8 @@ async def process_image_stream(image_bytes: io.BytesIO, variants_count: int = 5,
                         generate_variant,
                         image_part,
                         i + 1,
-                        custom_prompt
+                        custom_prompt,
+                        aspect_ratio
                     )
                 )
                 tasks[task] = i + 1
@@ -168,7 +171,7 @@ async def process_image_stream(image_bytes: io.BytesIO, variants_count: int = 5,
         logger.error(f"Критическая ошибка при обработке изображения: {e}")
 
 
-async def process_image(image_bytes: io.BytesIO, variants_count: int = 5, custom_prompt: str = None) -> list[bytes]:
+async def process_image(image_bytes: io.BytesIO, variants_count: int = 5, custom_prompt: str = None, aspect_ratio: str = "1:1") -> list[bytes]:
     """
     Асинхронная обработка изображения с генерацией нескольких вариантов
     (для обратной совместимости)
@@ -177,12 +180,13 @@ async def process_image(image_bytes: io.BytesIO, variants_count: int = 5, custom
         image_bytes: Байты исходного изображения
         variants_count: Количество вариантов для генерации
         custom_prompt: Кастомный промпт (если None, используется стандартный)
+        aspect_ratio: Соотношение сторон (1:1, 3:4, 16:9, 9:16)
 
     Returns:
         list[bytes]: Список байтов обработанных изображений
     """
     results = []
-    async for idx, data in process_image_stream(image_bytes, variants_count, custom_prompt):
+    async for idx, data in process_image_stream(image_bytes, variants_count, custom_prompt, aspect_ratio):
         results.append(data)
     logger.info(f"Успешно сгенерировано {len(results)} из {variants_count} вариантов")
     return results
